@@ -1023,7 +1023,8 @@ function QuranJournal() {
     const [reminderPrefs, setReminderPrefs] = useState({ enabled: false, activeStartHour: 7, activeEndHour: 21, intervalHours: 3 });
     const [prayerPushEnabled, setPrayerPushEnabled] = useState(false);
     const [adhanPlayedToday, setAdhanPlayedToday] = useState({}); // { "YYYY-MM-DD:Fajr": true, ... }
-    const [authSession, setAuthSession] = useState(null); // { name, token } or null
+    const [authSession, setAuthSession] = useState(() => loadAuthSession()); // { name, token } or null — read synchronously so the popup below never flashes for someone already logged in
+    const [authPopupDismissed, setAuthPopupDismissed] = useState(false); // resets every time the app is opened, by design
     const [authMode, setAuthMode] = useState("login"); // "login" | "signup"
     const [authName, setAuthName] = useState("");
     const [authPassword, setAuthPassword] = useState("");
@@ -1109,13 +1110,13 @@ function QuranJournal() {
     // If we were already logged in on a previous visit, fetch the latest copy
     // of this account's journal data from the server — in case it was last
     // updated on a different device — and use that instead of what's local.
+    // (authSession itself is already set synchronously above, from local
+    // storage, so the popup below never flashes for a logged-in visitor.)
     useEffect(() => {
-        const session = loadAuthSession();
-        if (!session || !session.token)
+        if (!authSession || !authSession.token)
             return;
-        setAuthSession(session);
         setSyncStatus("syncing");
-        syncLoadFromServer(session.token)
+        syncLoadFromServer(authSession.token)
             .then(data => {
             if (data.journalData)
                 applyJournalData(data.journalData);
@@ -1235,6 +1236,20 @@ function QuranJournal() {
             setAdminStatus("error");
         }
     };
+    // The Log In / Sign Up form itself, shared between the Account page and the
+    // popup that gently nudges signed-out visitors — same state, same behavior,
+    // just rendered in two different places.
+    const renderAuthForm = () => (React.createElement(React.Fragment, null,
+        React.createElement("div", { style: { display: "flex", gap: "0.5rem", marginBottom: "1.2rem", justifyContent: "center" } }, [["login", "Log In"], ["signup", "Sign Up"]].map(([m, label]) => (React.createElement("button", { key: m, onClick: () => { setAuthMode(m); setAuthError(""); }, style: { background: authMode === m ? COLORS.dustyPink : "transparent", color: authMode === m ? "#fff" : COLORS.taupe, border: `1px solid ${COLORS.dustyPink}`, borderRadius: 16, padding: "0.4rem 1.1rem", fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, label)))),
+        React.createElement("div", { style: { marginBottom: "0.8rem" } },
+            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Name"),
+            React.createElement("input", { type: "text", value: authName, onChange: e => setAuthName(e.target.value), placeholder: "Your name", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
+        React.createElement("div", { style: { marginBottom: "1rem" } },
+            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Password"),
+            React.createElement("input", { type: "password", value: authPassword, onChange: e => setAuthPassword(e.target.value), placeholder: authMode === "signup" ? "At least 6 characters" : "Your password", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
+        authStatus === "error" && authError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.7rem 0.9rem", marginBottom: "1rem", fontSize: "0.78rem", color: "#a04" } }, authError)),
+        React.createElement("button", { onClick: () => (authMode === "signup" ? doSignup() : doLogin()), disabled: authStatus === "working" || !authName.trim() || authPassword.length < (authMode === "signup" ? 6 : 1), style: { width: "100%", background: COLORS.dustyPink, color: "#fff", border: "none", borderRadius: 20, padding: "0.7rem 1rem", fontSize: "0.85rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif", opacity: authStatus === "working" ? 0.6 : 1 } }, authStatus === "working" ? "Working…" : authMode === "signup" ? "Create Account" : "Log In"),
+        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem", textAlign: "center" } }, authMode === "signup" ? "Your name only needs to be unique on this app — no email required." : "Forgot your password? There's no reset flow yet — just sign up again with a different name if needed.")));
     const filtered = ALL_SURAHS.filter(s => {
         const q = search.toLowerCase();
         const matchSearch = s.name.toLowerCase().includes(q) || s.arabic.includes(q) || String(s.number).includes(q) || s.meaning.toLowerCase().includes(q);
@@ -2440,27 +2455,18 @@ function QuranJournal() {
                             React.createElement("div", { style: { fontSize: "0.82rem", color: COLORS.taupe, lineHeight: 1.6, fontFamily: "'Cormorant Garamond', serif", fontStyle: "italic" } }, reminder))))),
                     React.createElement("div", { style: { textAlign: "center", marginTop: "1.5rem" } },
                         React.createElement("button", { onClick: resetJournal, style: { background: "transparent", border: `1px solid ${COLORS.taupe}66`, color: COLORS.taupe, borderRadius: 20, padding: "0.5rem 1.2rem", fontSize: "0.75rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, "Clear all my saved journal data on this device"),
-                        React.createElement("div", { style: { fontSize: "0.68rem", color: COLORS.taupe, opacity: 0.7, marginTop: "0.4rem" } }, "Your notes, duas, favorites, and tracked days are saved only in this browser, on this device.")))),
+                        React.createElement("div", { style: { fontSize: "0.68rem", color: COLORS.taupe, opacity: 0.7, marginTop: "0.4rem" } }, "Your notes, duas, favorites, and tracked days are saved only in this browser, on this device."))))),
                 page === "account" && (React.createElement("div", null,
                     React.createElement("div", { style: { textAlign: "center", marginBottom: "1.5rem" } },
                         React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "2rem", color: COLORS.deepTaupe } }, "Account \uD83D\uDC64"),
                         React.createElement("div", { style: { color: COLORS.taupe, fontSize: "0.82rem" } }, authSession ? "Your journal follows you across devices while logged in." : "Log in to keep your journal in sync across your devices.")),
                     !authSession ? (React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto" } },
-                        React.createElement("div", { style: { display: "flex", gap: "0.5rem", marginBottom: "1.2rem", justifyContent: "center" } }, [["login", "Log In"], ["signup", "Sign Up"]].map(([m, label]) => (React.createElement("button", { key: m, onClick: () => { setAuthMode(m); setAuthError(""); }, style: { background: authMode === m ? COLORS.dustyPink : "transparent", color: authMode === m ? "#fff" : COLORS.taupe, border: `1px solid ${COLORS.dustyPink}`, borderRadius: 16, padding: "0.4rem 1.1rem", fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, label)))),
-                        React.createElement("div", { style: { marginBottom: "0.8rem" } },
-                            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Name"),
-                            React.createElement("input", { type: "text", value: authName, onChange: e => setAuthName(e.target.value), placeholder: "Your name", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
-                        React.createElement("div", { style: { marginBottom: "1rem" } },
-                            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Password"),
-                            React.createElement("input", { type: "password", value: authPassword, onChange: e => setAuthPassword(e.target.value), placeholder: authMode === "signup" ? "At least 6 characters" : "Your password", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
-                        authStatus === "error" && authError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.7rem 0.9rem", marginBottom: "1rem", fontSize: "0.78rem", color: "#a04" } }, authError)),
-                        React.createElement("button", { onClick: () => (authMode === "signup" ? doSignup() : doLogin()), disabled: authStatus === "working" || !authName.trim() || authPassword.length < (authMode === "signup" ? 6 : 1), style: { width: "100%", background: COLORS.dustyPink, color: "#fff", border: "none", borderRadius: 20, padding: "0.7rem 1rem", fontSize: "0.85rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif", opacity: authStatus === "working" ? 0.6 : 1 } }, authStatus === "working" ? "Working…" : authMode === "signup" ? "Create Account" : "Log In"),
-                        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem", textAlign: "center" } }, authMode === "signup" ? "Your name only needs to be unique on this app — no email required." : ""))) : (React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto", textAlign: "center" } },
+                        renderAuthForm())) : (React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto", textAlign: "center" } },
                         React.createElement("div", { style: { fontSize: "1.8rem", marginBottom: "0.5rem" } }, "\uD83D\uDC64"),
                         React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.3rem", color: COLORS.deepTaupe } }, authSession.name),
                         React.createElement("div", { style: { fontSize: "0.78rem", color: COLORS.taupe, marginTop: "0.4rem" } }, syncStatus === "syncing" ? "Syncing\u2026" : syncStatus === "synced" ? "\u2713 Synced to your account" : syncStatus === "error" ? "Couldn't sync just now \u2014 will retry" : "Logged in"),
                         React.createElement("button", { onClick: doLogout, style: { marginTop: "1.2rem", background: "transparent", border: `1px solid ${COLORS.dustyPink}`, color: COLORS.deepTaupe, borderRadius: 20, padding: "0.5rem 1.3rem", fontSize: "0.82rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, "Log out"),
-                        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem" } }, "Log in with the same name and password on any other device to pick up right where you left off."))),
+                        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem" } }, "Log in with the same name and password on any other device to pick up right where you left off.")))),
                     isAdminView && (React.createElement(React.Fragment, null,
                     React.createElement("div", { className: "star-divider" }, "\u2726 \u2726 \u2726"),
                     React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.2rem 1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto" } },
@@ -2477,7 +2483,16 @@ function QuranJournal() {
                                 adminUsers.length === 1 ? "" : "S"),
                             adminUsers.map((u, i) => (React.createElement("div", { key: i, style: { display: "flex", justifyContent: "space-between", padding: "0.5rem 0", borderTop: i === 0 ? "none" : `1px solid ${COLORS.sand}`, fontSize: "0.8rem" } },
                                 React.createElement("span", { style: { color: COLORS.deepTaupe } }, u.name),
-                                React.createElement("span", { style: { color: COLORS.taupe, fontSize: "0.7rem" } }, u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleDateString() : "")))))))))))),
+                                React.createElement("span", { style: { color: COLORS.taupe, fontSize: "0.7rem" } }, u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleDateString() : "")))))))))),
+            hasLoaded && !authSession && !authPopupDismissed && (React.createElement("div", { onClick: () => setAuthPopupDismissed(true), style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(107,91,78,0.45)", zIndex: 900, display: "flex", alignItems: "center", justifyContent: "center", padding: "1rem" } },
+                React.createElement("div", { onClick: e => e.stopPropagation(), style: { background: COLORS.ivory, borderRadius: 20, padding: "1.6rem", maxWidth: 420, width: "100%", border: `2px solid ${COLORS.gold}44`, boxShadow: "0 12px 40px rgba(107,91,78,0.3)", position: "relative" } },
+                    React.createElement("button", { onClick: () => setAuthPopupDismissed(true), "aria-label": "Not now", style: { position: "absolute", top: 12, right: 14, background: "transparent", border: "none", fontSize: "1.2rem", color: COLORS.taupe, cursor: "pointer" } }, "\u2715"),
+                    React.createElement("div", { style: { textAlign: "center", marginBottom: "1.2rem" } },
+                        React.createElement("div", { style: { fontSize: "1.6rem", marginBottom: "0.4rem" } }, "\uD83D\uDC64"),
+                        React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.4rem", color: COLORS.deepTaupe } }, "Save your journal"),
+                        React.createElement("div", { style: { fontSize: "0.78rem", color: COLORS.taupe, marginTop: "0.3rem" } }, "Sign up or log in to keep your notes, favorites, and streaks with you on any device.")),
+                    renderAuthForm(),
+                    React.createElement("button", { onClick: () => setAuthPopupDismissed(true), style: { width: "100%", background: "transparent", border: "none", color: COLORS.taupe, fontSize: "0.78rem", cursor: "pointer", marginTop: "0.9rem", textDecoration: "underline", fontFamily: "'Poppins', sans-serif" } }, "Not now")))),
             React.createElement("button", { onClick: () => openBook(page === "surahs" && selectedSurah ? selectedSurah.number : 0), "aria-label": "Open the Quran book", className: "pin-book-btn", style: { position: "fixed", bottom: "calc(22px + env(safe-area-inset-bottom))", right: "calc(22px + env(safe-area-inset-right))", zIndex: 500, width: 60, height: 60, borderRadius: "50%", background: `linear-gradient(135deg, ${COLORS.gold}, ${COLORS.dustyPink})`, border: `2px solid ${COLORS.ivory}`, color: "#fff", fontSize: "1.6rem", cursor: "pointer", boxShadow: "0 6px 18px rgba(107,91,78,0.35)", display: "flex", alignItems: "center", justifyContent: "center", touchAction: "manipulation" }, title: "Open the Quran" }, "\uD83D\uDCD6"),
             bookOpen && (() => {
                 const p = BOOK_PAGES[bookPageIdx];
@@ -2583,3 +2598,4 @@ catch (err) {
 </script>
 </body>
 </html>
+       
