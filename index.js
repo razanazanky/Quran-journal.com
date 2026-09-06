@@ -557,6 +557,170 @@ async function handleTestPrayer(request, env) {
   }
 }
 
+// ---- Accounts (name + password), so journal data can follow someone across
+// ---- devices instead of being stuck in one browser's local storage. ----
+//
+// Passwords are never stored in plain text — only a salted PBKDF2 hash, using
+// the Web Crypto API that's built into Cloudflare Workers.
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function generateToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return bytesToBase64(bytes).replace(/[+/=]/g, (c) => ({ "+": "-", "/": "_", "=": "" }[c]));
+}
+// Turns a username into a stable lookup key: trimmed, lowercased, so
+// "Razan" and "razan " are treated as the same account.
+function normalizeUsername(name) {
+  return String(name || "").trim().toLowerCase();
+}
+async function hashPassword(password, saltBytes) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const derived = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: saltBytes, iterations: 100000, hash: "SHA-256" },
+    keyMaterial,
+    256
+  );
+  return bytesToBase64(new Uint8Array(derived));
+}
+async function verifyPassword(password, saltB64, hashB64) {
+  const saltBytes = base64ToBytes(saltB64);
+  const computed = await hashPassword(password, saltBytes);
+  // Constant-time-ish comparison — good enough here since this isn't a
+  // high-value target, but avoids the most obvious short-circuit timing leak.
+  if (computed.length !== hashB64.length) return false;
+  let diff = 0;
+  for (let i = 0; i < computed.length; i++) diff |= computed.charCodeAt(i) ^ hashB64.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleSignup(request, env) {
+  const body = await request.json().catch(() => null);
+  const displayName = body && typeof body.name === "string" ? body.name.trim() : "";
+  const password = body && typeof body.password === "string" ? body.password : "";
+  if (displayName.length < 2 || displayName.length > 40) {
+    return json({ error: "Name must be between 2 and 40 characters." }, 400);
+  }
+  if (password.length < 6) {
+    return json({ error: "Password must be at least 6 characters." }, 400);
+  }
+  const key = "user:" + normalizeUsername(displayName);
+  const existing = await env.USERS.get(key);
+  if (existing) {
+    return json({ error: "That name is already taken. Try logging in instead, or pick a different name." }, 409);
+  }
+  const saltBytes = new Uint8Array(16);
+  crypto.getRandomValues(saltBytes);
+  const salt = bytesToBase64(saltBytes);
+  const hash = await hashPassword(password, saltBytes);
+  const now = Date.now();
+  const record = { displayName, salt, hash, createdAt: now, lastActiveAt: now, journalData: null };
+  await env.USERS.put(key, JSON.stringify(record));
+  const token = generateToken();
+  await env.USERS.put("token:" + token, key);
+  return json({ ok: true, token, name: displayName });
+}
+
+async function handleLogin(request, env) {
+  const body = await request.json().catch(() => null);
+  const displayName = body && typeof body.name === "string" ? body.name.trim() : "";
+  const password = body && typeof body.password === "string" ? body.password : "";
+  const key = "user:" + normalizeUsername(displayName);
+  const raw = await env.USERS.get(key);
+  if (!raw) {
+    return json({ error: "No account with that name. Check the spelling, or sign up instead." }, 404);
+  }
+  const record = JSON.parse(raw);
+  const ok = await verifyPassword(password, record.salt, record.hash);
+  if (!ok) {
+    return json({ error: "Incorrect password." }, 401);
+  }
+  record.lastActiveAt = Date.now();
+  await env.USERS.put(key, JSON.stringify(record));
+  const token = generateToken();
+  await env.USERS.put("token:" + token, key);
+  return json({ ok: true, token, name: record.displayName, journalData: record.journalData });
+}
+
+async function handleLogout(request, env) {
+  const body = await request.json().catch(() => null);
+  const token = body && typeof body.token === "string" ? body.token : "";
+  if (token) await env.USERS.delete("token:" + token);
+  return json({ ok: true });
+}
+
+// Every write/read below looks up the account by session token rather than
+// trusting a name sent from the client, so one logged-in person can't
+// overwrite another person's data just by guessing their name.
+async function userKeyForToken(env, token) {
+  if (!token) return null;
+  return await env.USERS.get("token:" + token);
+}
+
+async function handleSyncSave(request, env) {
+  const body = await request.json().catch(() => null);
+  const token = body && typeof body.token === "string" ? body.token : "";
+  const key = await userKeyForToken(env, token);
+  if (!key) return json({ error: "Not logged in, or the session expired. Please log in again." }, 401);
+  const raw = await env.USERS.get(key);
+  if (!raw) return json({ error: "Account not found." }, 404);
+  const record = JSON.parse(raw);
+  record.journalData = body.journalData;
+  record.lastActiveAt = Date.now();
+  await env.USERS.put(key, JSON.stringify(record));
+  return json({ ok: true });
+}
+
+async function handleSyncLoad(request, env) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token") || "";
+  const key = await userKeyForToken(env, token);
+  if (!key) return json({ error: "Not logged in, or the session expired. Please log in again." }, 401);
+  const raw = await env.USERS.get(key);
+  if (!raw) return json({ error: "Account not found." }, 404);
+  const record = JSON.parse(raw);
+  return json({ ok: true, name: record.displayName, journalData: record.journalData });
+}
+
+// A simple, private view of who has signed up — protected by a secret key
+// only you know (set with `wrangler secret put ADMIN_KEY`), not exposed to
+// regular users. Never returns password hashes or journal contents.
+async function handleAdminUsers(request, env) {
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key") || "";
+  if (!env.ADMIN_KEY || key !== env.ADMIN_KEY) {
+    return json({ error: "Not authorized." }, 403);
+  }
+  const users = [];
+  let cursor;
+  do {
+    const page = await env.USERS.list({ cursor, limit: 1000 });
+    cursor = page.cursor;
+    for (const { name: k } of page.keys) {
+      if (!k.startsWith("user:")) continue;
+      const raw = await env.USERS.get(k);
+      if (!raw) continue;
+      try {
+        const record = JSON.parse(raw);
+        users.push({ name: record.displayName, createdAt: record.createdAt, lastActiveAt: record.lastActiveAt });
+      } catch (err) { /* skip malformed record */ }
+    }
+  } while (cursor);
+  users.sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
+  return json({ ok: true, users });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -587,6 +751,26 @@ export default {
 
     if (url.pathname === "/test-prayer" && request.method === "POST") {
       return handleTestPrayer(request, env);
+    }
+
+    // ---- Accounts, so journal data can follow someone across devices ----
+    if (url.pathname === "/signup" && request.method === "POST") {
+      return handleSignup(request, env);
+    }
+    if (url.pathname === "/login" && request.method === "POST") {
+      return handleLogin(request, env);
+    }
+    if (url.pathname === "/logout" && request.method === "POST") {
+      return handleLogout(request, env);
+    }
+    if (url.pathname === "/sync-save" && request.method === "POST") {
+      return handleSyncSave(request, env);
+    }
+    if (url.pathname === "/sync-load" && request.method === "GET") {
+      return handleSyncLoad(request, env);
+    }
+    if (url.pathname === "/admin/users" && request.method === "GET") {
+      return handleAdminUsers(request, env);
     }
 
     return json({ error: "Not found" }, 404);
