@@ -1,0 +1,48 @@
+name = "quran-journal-push"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Runs every 5 minutes. This is how often the Worker *checks* whether any
+# subscriber is due for a notification right now — for the general dhikr
+# reminders and challenges, each user still only gets pushed on their own
+# chosen schedule. For prayer-time (Adhan) notifications specifically, this
+# interval also determines how close to the exact prayer time the
+# notification arrives (worst case, up to ~5 minutes late). This was widened
+# from */15 to */5 specifically to make Adhan timing feel accurate — still
+# well within Cloudflare's free Cron Trigger + Worker request limits for a
+# personal-scale app (288 runs/day).
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Plain (non-secret) config. Safe to commit — the VAPID *public* key is meant to be
+# public, and the subject is just a contact email/URL required by the Web Push spec.
+[vars]
+VAPID_SUBJECT = "mailto:azankurazan@gmail.com"
+VAPID_PUBLIC_KEY = "BCfEermZWQo2WSJEX8bpIeiAVih2lqyZlsuf7Vo2aZOeoyAvE1HLiXnFCj42-ZrzR3qedmwUTCuKuZ93L0J7B_E"
+
+# The VAPID *private* key is set separately as an encrypted secret, never committed
+# to the repo. It's already set on the deployed Worker from before — you don't
+# need to set it again unless you're setting this up somewhere new:
+#   wrangler secret put VAPID_PRIVATE_KEY
+
+# KV namespace used to store each push subscription + the reminder/challenge/
+# prayer preferences that go with it, plus a short-lived cache of each day's
+# prayer times per location (keyed "pt:...") so many subscribers in the same
+# city don't each trigger a separate API call.
+[[kv_namespaces]]
+binding = "SUBSCRIPTIONS"
+id = "0148718ae6c249bdabb37f933b8c3f8c"
+
+# KV namespace for accounts (name + hashed password + each person's journal
+# data, so it can follow them across devices). Create this with
+# `wrangler kv namespace create USERS` and paste the id it prints below,
+# replacing the placeholder — same way SUBSCRIPTIONS was set up above.
+[[kv_namespaces]]
+binding = "USERS"
+id = "502d553f49e44940b8bbfe01e463a4ec"
+
+# ADMIN_KEY is a secret you make up yourself — a password only you know, used
+# to view the private /admin/users list of who has signed up. Set it with:
+#   wrangler secret put ADMIN_KEY
+# (never commit the actual value here — it's a secret, not a plain var)
