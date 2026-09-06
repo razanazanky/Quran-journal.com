@@ -248,6 +248,87 @@ async function sendTestPrayer(prayerName) {
         throw new Error(data.detail || data.error || "The test notification could not be sent.");
     }
 }
+// ===== Accounts (name + password) =====
+//
+// Lets someone's journal data follow them across devices instead of being
+// stuck in one browser's local storage. The session token is saved locally
+// so they stay logged in between visits, same as any normal website.
+const AUTH_STORAGE_KEY = "quranJournal.auth.v1";
+function loadAuthSession() {
+    try {
+        const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+    }
+    catch (err) {
+        return null;
+    }
+}
+function saveAuthSession(session) {
+    try {
+        if (session)
+            window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+        else
+            window.localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+    catch (err) { /* ignore */ }
+}
+async function signupAccount(name, password) {
+    const res = await fetch(PUSH_SERVER_URL + "/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error)
+        throw new Error(data.error || "Could not create the account.");
+    return data; // { ok, token, name }
+}
+async function loginAccount(name, password) {
+    const res = await fetch(PUSH_SERVER_URL + "/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error)
+        throw new Error(data.error || "Could not log in.");
+    return data; // { ok, token, name, journalData }
+}
+async function logoutAccount(token) {
+    try {
+        await fetch(PUSH_SERVER_URL + "/logout", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token }),
+        });
+    }
+    catch (err) { /* ignore — we still clear the local session either way */ }
+}
+async function syncSaveToServer(token, journalData) {
+    const res = await fetch(PUSH_SERVER_URL + "/sync-save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, journalData }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error)
+        throw new Error(data.error || "Could not sync to the server.");
+    return data;
+}
+async function syncLoadFromServer(token) {
+    const res = await fetch(PUSH_SERVER_URL + "/sync-load?token=" + encodeURIComponent(token));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error)
+        throw new Error(data.error || "Could not load your data from the server.");
+    return data; // { ok, name, journalData }
+}
+async function fetchAdminUsers(adminKey) {
+    const res = await fetch(PUSH_SERVER_URL + "/admin/users?key=" + encodeURIComponent(adminKey));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error)
+        throw new Error(data.error || "Could not load the user list.");
+    return data.users || [];
+}
 // ===== Prayer Times & Qibla =====
 //
 // Prayer times come from the Al Adhan API (api.aladhan.com — free, no key,
@@ -941,6 +1022,21 @@ function QuranJournal() {
     const [dhikrCategory, setDhikrCategory] = useState("Morning");
     const [reminderPrefs, setReminderPrefs] = useState({ enabled: false, activeStartHour: 7, activeEndHour: 21, intervalHours: 3 });
     const [prayerPushEnabled, setPrayerPushEnabled] = useState(false);
+    const [adhanPlayedToday, setAdhanPlayedToday] = useState({}); // { "YYYY-MM-DD:Fajr": true, ... }
+    const [authSession, setAuthSession] = useState(null); // { name, token } or null
+    const [authMode, setAuthMode] = useState("login"); // "login" | "signup"
+    const [authName, setAuthName] = useState("");
+    const [authPassword, setAuthPassword] = useState("");
+    const [authStatus, setAuthStatus] = useState("idle"); // idle | working | error
+    const [authError, setAuthError] = useState("");
+    const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
+    const [adminKeyInput, setAdminKeyInput] = useState("");
+    const [adminUsers, setAdminUsers] = useState(null);
+    const [adminStatus, setAdminStatus] = useState("idle"); // idle | loading | error
+    const [adminError, setAdminError] = useState("");
+    const syncSaveTimer = useRef(null);
+    const [adhanPlayError, setAdhanPlayError] = useState("");
+    const adhanUnlockedRef = useRef(false);
     const [prayerPushStatus, setPrayerPushStatus] = useState("idle"); // idle | working | error
     const [prayerPushError, setPrayerPushError] = useState("");
     const [testPrayerStatus, setTestPrayerStatus] = useState("idle");
@@ -975,34 +1071,60 @@ function QuranJournal() {
     const [hasLoaded, setHasLoaded] = useState(false);
     const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved
     const saveTimer = useRef(null);
+    // Applies a saved-journal-shaped object to all the relevant state setters —
+    // shared by the local-storage load below and by server sync after login.
+    const applyJournalData = (saved) => {
+        if (!saved)
+            return;
+        setGoals(saved.goals || {});
+        setTracker(saved.tracker || {});
+        setFavorites(saved.favorites || []);
+        setNotes(saved.notes || {});
+        setLastRead(saved.lastRead || null);
+        setDhikrCounts(saved.dhikrCounts || {});
+        setFullTextCache(saved.fullTextCache || {});
+        if (saved.reminderPrefs)
+            setReminderPrefs(saved.reminderPrefs);
+        if (saved.challengePrefs)
+            setChallengePrefs(saved.challengePrefs);
+        setChallengeLog(saved.challengeLog || {});
+        if (saved.prayerLocation)
+            setPrayerLocation(saved.prayerLocation);
+        if (saved.prayerMethod)
+            setPrayerMethod(saved.prayerMethod);
+        if (saved.prayerData)
+            setPrayerData(saved.prayerData);
+        if (saved.prayerFetchedFor)
+            setPrayerFetchedFor(saved.prayerFetchedFor);
+        if (saved.prayerPushEnabled)
+            setPrayerPushEnabled(saved.prayerPushEnabled);
+        if (saved.adhanPlayedToday)
+            setAdhanPlayedToday(saved.adhanPlayedToday);
+    };
     // Load everything saved from a previous visit, once, on first render.
     useEffect(() => {
-        const saved = loadJournalState();
-        if (saved) {
-            setGoals(saved.goals || {});
-            setTracker(saved.tracker || {});
-            setFavorites(saved.favorites || []);
-            setNotes(saved.notes || {});
-            setLastRead(saved.lastRead || null);
-            setDhikrCounts(saved.dhikrCounts || {});
-            setFullTextCache(saved.fullTextCache || {});
-            if (saved.reminderPrefs)
-                setReminderPrefs(saved.reminderPrefs);
-            if (saved.challengePrefs)
-                setChallengePrefs(saved.challengePrefs);
-            setChallengeLog(saved.challengeLog || {});
-            if (saved.prayerLocation)
-                setPrayerLocation(saved.prayerLocation);
-            if (saved.prayerMethod)
-                setPrayerMethod(saved.prayerMethod);
-            if (saved.prayerData)
-                setPrayerData(saved.prayerData);
-            if (saved.prayerFetchedFor)
-                setPrayerFetchedFor(saved.prayerFetchedFor);
-            if (saved.prayerPushEnabled)
-                setPrayerPushEnabled(saved.prayerPushEnabled);
-        }
+        applyJournalData(loadJournalState());
         setHasLoaded(true);
+    }, []);
+    // If we were already logged in on a previous visit, fetch the latest copy
+    // of this account's journal data from the server — in case it was last
+    // updated on a different device — and use that instead of what's local.
+    useEffect(() => {
+        const session = loadAuthSession();
+        if (!session || !session.token)
+            return;
+        setAuthSession(session);
+        setSyncStatus("syncing");
+        syncLoadFromServer(session.token)
+            .then(data => {
+            if (data.journalData)
+                applyJournalData(data.journalData);
+            setSyncStatus("synced");
+        })
+            .catch(err => {
+            console.warn("Could not sync from server:", err);
+            setSyncStatus("error");
+        });
     }, []);
     // If opened from a challenge or prayer-time notification tap, jump straight there.
     useEffect(() => {
@@ -1031,12 +1153,88 @@ function QuranJournal() {
         setSaveStatus("saving");
         if (saveTimer.current)
             clearTimeout(saveTimer.current);
+        const currentJournalData = { goals, tracker, favorites, notes, lastRead, dhikrCounts, fullTextCache, reminderPrefs, challengePrefs, challengeLog, prayerLocation, prayerMethod, prayerData, prayerFetchedFor, prayerPushEnabled, adhanPlayedToday };
         saveTimer.current = setTimeout(() => {
-            saveJournalState({ goals, tracker, favorites, notes, lastRead, dhikrCounts, fullTextCache, reminderPrefs, challengePrefs, challengeLog, prayerLocation, prayerMethod, prayerData, prayerFetchedFor, prayerPushEnabled });
+            saveJournalState(currentJournalData);
             setSaveStatus("saved");
         }, 500);
-        return () => clearTimeout(saveTimer.current);
-    }, [goals, tracker, favorites, notes, lastRead, dhikrCounts, fullTextCache, reminderPrefs, challengePrefs, challengeLog, prayerLocation, prayerMethod, prayerData, prayerFetchedFor, prayerPushEnabled, hasLoaded]);
+        // Also push to the server (separately debounced, a bit longer) if logged in,
+        // so this device's changes become visible on any other device too.
+        if (authSession && authSession.token) {
+            setSyncStatus("syncing");
+            if (syncSaveTimer.current)
+                clearTimeout(syncSaveTimer.current);
+            syncSaveTimer.current = setTimeout(() => {
+                syncSaveToServer(authSession.token, currentJournalData)
+                    .then(() => setSyncStatus("synced"))
+                    .catch(err => { console.warn("Sync to server failed:", err); setSyncStatus("error"); });
+            }, 1200);
+        }
+        return () => { clearTimeout(saveTimer.current); clearTimeout(syncSaveTimer.current); };
+    }, [goals, tracker, favorites, notes, lastRead, dhikrCounts, fullTextCache, reminderPrefs, challengePrefs, challengeLog, prayerLocation, prayerMethod, prayerData, prayerFetchedFor, prayerPushEnabled, adhanPlayedToday, hasLoaded, authSession]);
+    // ---- Account actions ----
+    const doSignup = async () => {
+        setAuthStatus("working");
+        setAuthError("");
+        try {
+            const data = await signupAccount(authName.trim(), authPassword);
+            const session = { name: data.name, token: data.token };
+            saveAuthSession(session);
+            setAuthSession(session);
+            setAuthPassword("");
+            setAuthStatus("idle");
+            // Brand-new account — push whatever's currently on this device up as
+            // its first save, so signing up doesn't start them off empty-handed.
+            setSyncStatus("syncing");
+            syncSaveToServer(session.token, { goals, tracker, favorites, notes, lastRead, dhikrCounts, fullTextCache, reminderPrefs, challengePrefs, challengeLog, prayerLocation, prayerMethod, prayerData, prayerFetchedFor, prayerPushEnabled, adhanPlayedToday })
+                .then(() => setSyncStatus("synced"))
+                .catch(() => setSyncStatus("error"));
+        }
+        catch (err) {
+            setAuthError(err && err.message ? err.message : String(err));
+            setAuthStatus("error");
+        }
+    };
+    const doLogin = async () => {
+        setAuthStatus("working");
+        setAuthError("");
+        try {
+            const data = await loginAccount(authName.trim(), authPassword);
+            const session = { name: data.name, token: data.token };
+            saveAuthSession(session);
+            setAuthSession(session);
+            setAuthPassword("");
+            setAuthStatus("idle");
+            if (data.journalData)
+                applyJournalData(data.journalData);
+            setSyncStatus("synced");
+        }
+        catch (err) {
+            setAuthError(err && err.message ? err.message : String(err));
+            setAuthStatus("error");
+        }
+    };
+    const doLogout = async () => {
+        if (authSession && authSession.token) {
+            logoutAccount(authSession.token).catch(() => { });
+        }
+        saveAuthSession(null);
+        setAuthSession(null);
+        setSyncStatus("idle");
+    };
+    const loadAdminUsers = async () => {
+        setAdminStatus("loading");
+        setAdminError("");
+        try {
+            const users = await fetchAdminUsers(adminKeyInput);
+            setAdminUsers(users);
+            setAdminStatus("idle");
+        }
+        catch (err) {
+            setAdminError(err && err.message ? err.message : String(err));
+            setAdminStatus("error");
+        }
+    };
     const filtered = ALL_SURAHS.filter(s => {
         const q = search.toLowerCase();
         const matchSearch = s.name.toLowerCase().includes(q) || s.arabic.includes(q) || String(s.number).includes(q) || s.meaning.toLowerCase().includes(q);
@@ -1075,6 +1273,16 @@ function QuranJournal() {
         catch (err) { /* ignore */ }
     };
     const streak = currentStreak(tracker);
+    // Only visible to whoever opens the app with ?admin=1 in the URL — regular
+    // users never see that this section exists at all.
+    const isAdminView = (() => {
+        try {
+            return new URLSearchParams(window.location.search).get("admin") === "1";
+        }
+        catch (err) {
+            return false;
+        }
+    })();
     const todayKey = getDateKey(new Date());
     // Prayer-time (Adhan) push notifications reuse whatever location/method is
     // already set on the Qibla page — no separate location picker needed.
@@ -1482,6 +1690,63 @@ function QuranJournal() {
         const s = Math.floor((diffMs % 60000) / 1000);
         return { name: next.name, time: next.time, countdown: `${pad2(h)}:${pad2(m)}:${pad2(s)}` };
     })();
+    // Unlock audio playback the first time the person taps anywhere in the app —
+    // browsers block audio.play() calls that aren't triggered by a fresh user
+    // gesture, so a single silent "unlock" play lets later automatic plays
+    // (triggered by the clock, not a tap) go through for the rest of this visit.
+    useEffect(() => {
+        const unlock = () => {
+            if (adhanUnlockedRef.current)
+                return;
+            try {
+                const a = new Audio();
+                a.play().catch(() => { });
+            }
+            catch (err) { /* ignore */ }
+            adhanUnlockedRef.current = true;
+        };
+        window.addEventListener("pointerdown", unlock, { once: true });
+        return () => window.removeEventListener("pointerdown", unlock);
+    }, []);
+    function playAdhanAudio() {
+        try {
+            const audio = new Audio("audio/adhan.mp3");
+            audio.play().catch(err => {
+                setAdhanPlayError("Couldn't auto-play the adhan (" + (err && err.message ? err.message : String(err)) + "). Tap anywhere in the app, then it should play at the next prayer.");
+            });
+        }
+        catch (err) {
+            setAdhanPlayError(err && err.message ? err.message : String(err));
+        }
+    }
+    // While the app is open (any page) and today's prayer times are loaded, check
+    // every 15s whether a prayer's time has just begun, and if so, play the real
+    // Adhan audio file — foreground-only, since browsers don't allow custom sounds
+    // on background push notifications no matter what (see the Reminders page note).
+    // Add your own audio file at audio/adhan.mp3 next to index.html to enable this.
+    useEffect(() => {
+        if (!prayerData || !prayerData.timings)
+            return;
+        const checkAndPlay = () => {
+            const nowLocal = new Date();
+            const dateKey = getDateKey(nowLocal);
+            PRAYER_ORDER.filter(n => n !== "Sunrise").forEach(name => {
+                const t = (prayerData.timings[name] || "").slice(0, 5);
+                if (!t)
+                    return;
+                const prayerTime = timeStringToDate(t, nowLocal);
+                const diffMs = nowLocal.getTime() - prayerTime.getTime();
+                const key = `${dateKey}:${name}`;
+                if (diffMs >= 0 && diffMs < 60000 && !adhanPlayedToday[key]) {
+                    setAdhanPlayedToday(prev => ({ ...prev, [key]: true }));
+                    playAdhanAudio();
+                }
+            });
+        };
+        checkAndPlay();
+        const id = setInterval(checkAndPlay, 15000);
+        return () => clearInterval(id);
+    }, [prayerData, adhanPlayedToday]);
     const dhikrKey = (id) => `${todayKey}:${id}`;
     const getDhikrCount = (id) => dhikrCounts[dhikrKey(id)] || 0;
     const incrementDhikr = (id) => {
@@ -1576,9 +1841,9 @@ function QuranJournal() {
         React.createElement("div", { style: { minHeight: "100vh", background: COLORS.ivory, fontFamily: "'Poppins', sans-serif" } },
             React.createElement("nav", { style: { background: COLORS.sand, borderBottom: `2px solid ${COLORS.dustyPink}`, paddingTop: "calc(0.8rem + env(safe-area-inset-top))", paddingBottom: "0.6rem", paddingLeft: "calc(1rem + env(safe-area-inset-left))", paddingRight: "calc(1rem + env(safe-area-inset-right))", position: "sticky", top: 0, zIndex: 100, boxShadow: "0 2px 12px rgba(212,175,55,0.10)" } },
                 React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" } },
-                    React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.15rem", color: COLORS.deepTaupe, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer" }, onClick: () => setPage("cover") }, "\u2726 My Quran Journal"),
+                    React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.15rem", color: COLORS.deepTaupe, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer" }, onClick: () => setPage("cover") }, authSession ? `\u2726 ${authSession.name}\u2019s Quran Journal` : "\u2726 My Quran Journal"),
                     React.createElement("span", { "aria-live": "polite", style: { fontSize: "0.65rem", color: COLORS.taupe, opacity: 0.75, flexShrink: 0, marginLeft: "0.5rem", textAlign: "right" } }, saveStatus === "saving" ? "Saving…" : hasLoaded ? "✓ Saved" : "")),
-                React.createElement("div", { className: "nav-scroll", style: { display: "flex", gap: "0.5rem", alignItems: "center", overflowX: "auto", paddingBottom: "0.25rem", paddingTop: "0.1rem", paddingRight: "0.4rem" } }, [["cover", "Cover"], ["intro", "Intro"], ["surahs", "Surahs"], ["dhikr", "Dhikr"], ["prayers", "Prayers"], ["reminders", "Reminders"], ["tracker", "Tracker"], ["favorites", "Favorites"], ["extras", "Extras"]].map(([pg, label]) => (React.createElement("button", { key: pg, onClick: () => { setPage(pg); setSelectedSurah(null); }, style: { background: page === pg ? COLORS.dustyPink : "transparent", color: page === pg ? "#fff" : COLORS.taupe, border: `1px solid ${COLORS.dustyPink}`, borderRadius: 20, padding: "0.55rem 1rem", minHeight: 40, fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif", fontWeight: 500, transition: "all 0.2s", flexShrink: 0, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center", touchAction: "manipulation" } }, label))))),
+                React.createElement("div", { className: "nav-scroll", style: { display: "flex", gap: "0.5rem", alignItems: "center", overflowX: "auto", paddingBottom: "0.25rem", paddingTop: "0.1rem", paddingRight: "0.4rem" } }, [["cover", "Cover"], ["intro", "Intro"], ["surahs", "Surahs"], ["dhikr", "Dhikr"], ["prayers", "Prayers"], ["reminders", "Reminders"], ["tracker", "Tracker"], ["favorites", "Favorites"], ["extras", "Extras"], ["account", authSession ? authSession.name : "Account"]].map(([pg, label]) => (React.createElement("button", { key: pg, onClick: () => { setPage(pg); setSelectedSurah(null); }, style: { background: page === pg ? COLORS.dustyPink : "transparent", color: page === pg ? "#fff" : COLORS.taupe, border: `1px solid ${COLORS.dustyPink}`, borderRadius: 20, padding: "0.55rem 1rem", minHeight: 40, fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif", fontWeight: 500, transition: "all 0.2s", flexShrink: 0, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center", touchAction: "manipulation" } }, label))))),
             React.createElement("main", { style: { maxWidth: 860, margin: "0 auto", padding: "1.5rem 1rem", paddingLeft: "calc(1rem + env(safe-area-inset-left))", paddingRight: "calc(1rem + env(safe-area-inset-right))", paddingBottom: "calc(1.5rem + env(safe-area-inset-bottom))" } },
                 page === "cover" && (React.createElement("div", { style: { textAlign: "center", padding: "2rem 1rem" } },
                     React.createElement("div", { style: { background: `linear-gradient(145deg, ${COLORS.sand}, ${COLORS.lightPink})`, borderRadius: 24, padding: "3rem 2rem", border: `2px solid ${COLORS.dustyPink}`, position: "relative", overflow: "hidden", boxShadow: "0 8px 32px rgba(212,175,55,0.12)" } },
@@ -2082,7 +2347,9 @@ function QuranJournal() {
                         prayerPushStatus === "error" && prayerPushError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.8rem 1rem", marginTop: "1rem", fontSize: "0.78rem", color: "#a04" } }, prayerPushError)),
                         prayerPushEnabled && (React.createElement("div", { style: { textAlign: "center", marginTop: "1.1rem" } },
                             React.createElement("button", { onClick: testPrayerPush, disabled: testPrayerStatus === "sending", style: { background: "transparent", border: `1px solid ${COLORS.gold}`, color: COLORS.deepTaupe, borderRadius: 20, padding: "0.5rem 1.2rem", fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, testPrayerStatus === "sending" ? "Sending…" : testPrayerStatus === "sent" ? "Sent! Check your notifications ✓" : testPrayerStatus === "error" ? "Couldn't send — see message above" : "Send me a test notification"))),
-                        React.createElement("div", { style: { fontSize: "0.72rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1.1rem" } }, "This is a text + vibration notification, timed to each prayer \u2014 web browsers don't allow a custom Adhan recording to play automatically in the background (only when the app itself is open can real audio play). Notifications can arrive up to a few minutes after the exact time depending on your device.")))),
+                        React.createElement("div", { style: { fontSize: "0.72rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1.1rem" } }, "This is a text + vibration notification, timed to each prayer \u2014 web browsers don't allow a custom Adhan recording to play automatically in the background."),
+                        adhanPlayError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.7rem 0.9rem", marginTop: "0.8rem", fontSize: "0.72rem", color: "#a04" } }, adhanPlayError)),
+                        React.createElement("div", { style: { fontSize: "0.72rem", color: COLORS.taupe, opacity: 0.8, marginTop: "0.6rem" } }, "While the app is open, it will automatically play a real adhan recording at the moment each prayer's time begins. Add your own audio file at ", React.createElement("code", null, "audio/adhan.mp3"), " next to index.html to enable this \u2014 pick a recording you have the rights to use.")))),
                 page === "tracker" && (React.createElement("div", null,
                     React.createElement("div", { style: { textAlign: "center", marginBottom: "1.5rem" } },
                         React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "2rem", color: COLORS.deepTaupe } }, "My Quran Tracker"),
@@ -2174,6 +2441,43 @@ function QuranJournal() {
                     React.createElement("div", { style: { textAlign: "center", marginTop: "1.5rem" } },
                         React.createElement("button", { onClick: resetJournal, style: { background: "transparent", border: `1px solid ${COLORS.taupe}66`, color: COLORS.taupe, borderRadius: 20, padding: "0.5rem 1.2rem", fontSize: "0.75rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, "Clear all my saved journal data on this device"),
                         React.createElement("div", { style: { fontSize: "0.68rem", color: COLORS.taupe, opacity: 0.7, marginTop: "0.4rem" } }, "Your notes, duas, favorites, and tracked days are saved only in this browser, on this device."))))),
+                page === "account" && (React.createElement("div", null,
+                    React.createElement("div", { style: { textAlign: "center", marginBottom: "1.5rem" } },
+                        React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "2rem", color: COLORS.deepTaupe } }, "Account \uD83D\uDC64"),
+                        React.createElement("div", { style: { color: COLORS.taupe, fontSize: "0.82rem" } }, authSession ? "Your journal follows you across devices while logged in." : "Log in to keep your journal in sync across your devices.")),
+                    !authSession ? (React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto" } },
+                        React.createElement("div", { style: { display: "flex", gap: "0.5rem", marginBottom: "1.2rem", justifyContent: "center" } }, [["login", "Log In"], ["signup", "Sign Up"]].map(([m, label]) => (React.createElement("button", { key: m, onClick: () => { setAuthMode(m); setAuthError(""); }, style: { background: authMode === m ? COLORS.dustyPink : "transparent", color: authMode === m ? "#fff" : COLORS.taupe, border: `1px solid ${COLORS.dustyPink}`, borderRadius: 16, padding: "0.4rem 1.1rem", fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, label)))),
+                        React.createElement("div", { style: { marginBottom: "0.8rem" } },
+                            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Name"),
+                            React.createElement("input", { type: "text", value: authName, onChange: e => setAuthName(e.target.value), placeholder: "Your name", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
+                        React.createElement("div", { style: { marginBottom: "1rem" } },
+                            React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.3rem" } }, "Password"),
+                            React.createElement("input", { type: "password", value: authPassword, onChange: e => setAuthPassword(e.target.value), placeholder: authMode === "signup" ? "At least 6 characters" : "Your password", style: { width: "100%", border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.6rem 0.8rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.85rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } })),
+                        authStatus === "error" && authError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.7rem 0.9rem", marginBottom: "1rem", fontSize: "0.78rem", color: "#a04" } }, authError)),
+                        React.createElement("button", { onClick: () => (authMode === "signup" ? doSignup() : doLogin()), disabled: authStatus === "working" || !authName.trim() || authPassword.length < (authMode === "signup" ? 6 : 1), style: { width: "100%", background: COLORS.dustyPink, color: "#fff", border: "none", borderRadius: 20, padding: "0.7rem 1rem", fontSize: "0.85rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif", opacity: authStatus === "working" ? 0.6 : 1 } }, authStatus === "working" ? "Working…" : authMode === "signup" ? "Create Account" : "Log In"),
+                        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem", textAlign: "center" } }, authMode === "signup" ? "Your name only needs to be unique on this app — no email required." : "Forgot your password? There's no reset flow yet — just sign up again with a different name if needed."))) : (React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto", textAlign: "center" } },
+                        React.createElement("div", { style: { fontSize: "1.8rem", marginBottom: "0.5rem" } }, "\uD83D\uDC64"),
+                        React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.3rem", color: COLORS.deepTaupe } }, authSession.name),
+                        React.createElement("div", { style: { fontSize: "0.78rem", color: COLORS.taupe, marginTop: "0.4rem" } }, syncStatus === "syncing" ? "Syncing\u2026" : syncStatus === "synced" ? "\u2713 Synced to your account" : syncStatus === "error" ? "Couldn't sync just now \u2014 will retry" : "Logged in"),
+                        React.createElement("button", { onClick: doLogout, style: { marginTop: "1.2rem", background: "transparent", border: `1px solid ${COLORS.dustyPink}`, color: COLORS.deepTaupe, borderRadius: 20, padding: "0.5rem 1.3rem", fontSize: "0.82rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, "Log out"),
+                        React.createElement("div", { style: { fontSize: "0.7rem", color: COLORS.taupe, opacity: 0.8, marginTop: "1rem" } }, "Log in with the same name and password on any other device to pick up right where you left off.")))),
+                    isAdminView && (React.createElement(React.Fragment, null,
+                    React.createElement("div", { className: "star-divider" }, "\u2726 \u2726 \u2726"),
+                    React.createElement("div", { style: { background: "#fff", borderRadius: 16, padding: "1.2rem 1.4rem", border: `1px solid ${COLORS.sand}`, maxWidth: 420, margin: "0 auto" } },
+                        React.createElement("div", { style: { fontFamily: "'Cormorant Garamond', serif", fontSize: "1.05rem", color: COLORS.deepTaupe, marginBottom: "0.6rem" } }, "\uD83D\uDD10 Admin: who's using this app"),
+                        React.createElement("div", { style: { fontSize: "0.75rem", color: COLORS.taupe, marginBottom: "0.8rem" } }, "For the app owner only \u2014 enter the admin key you set on the server to see who's signed up."),
+                        React.createElement("div", { style: { display: "flex", gap: "0.5rem", marginBottom: "0.8rem" } },
+                            React.createElement("input", { type: "password", value: adminKeyInput, onChange: e => setAdminKeyInput(e.target.value), placeholder: "Admin key", style: { flex: 1, border: `1px solid ${COLORS.dustyPink}55`, borderRadius: 10, padding: "0.5rem 0.7rem", fontFamily: "'Poppins', sans-serif", fontSize: "0.82rem", background: COLORS.ivory, color: COLORS.deepTaupe, outline: "none" } }),
+                            React.createElement("button", { onClick: loadAdminUsers, disabled: !adminKeyInput || adminStatus === "loading", style: { background: COLORS.dustyPink, color: "#fff", border: "none", borderRadius: 16, padding: "0.5rem 1rem", fontSize: "0.8rem", cursor: "pointer", fontFamily: "'Poppins', sans-serif" } }, adminStatus === "loading" ? "…" : "View")),
+                        adminStatus === "error" && adminError && (React.createElement("div", { style: { background: "#fee", border: "1px solid #f9c", borderRadius: 12, padding: "0.6rem 0.8rem", marginBottom: "0.8rem", fontSize: "0.75rem", color: "#a04" } }, adminError)),
+                        adminUsers && (React.createElement("div", null,
+                            React.createElement("div", { style: { fontSize: "0.72rem", color: COLORS.gold, letterSpacing: "0.08em", marginBottom: "0.5rem" } },
+                                adminUsers.length,
+                                " ACCOUNT",
+                                adminUsers.length === 1 ? "" : "S"),
+                            adminUsers.map((u, i) => (React.createElement("div", { key: i, style: { display: "flex", justifyContent: "space-between", padding: "0.5rem 0", borderTop: i === 0 ? "none" : `1px solid ${COLORS.sand}`, fontSize: "0.8rem" } },
+                                React.createElement("span", { style: { color: COLORS.deepTaupe } }, u.name),
+                                React.createElement("span", { style: { color: COLORS.taupe, fontSize: "0.7rem" } }, u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleDateString() : "")))))))))),
             React.createElement("button", { onClick: () => openBook(page === "surahs" && selectedSurah ? selectedSurah.number : 0), "aria-label": "Open the Quran book", className: "pin-book-btn", style: { position: "fixed", bottom: "calc(22px + env(safe-area-inset-bottom))", right: "calc(22px + env(safe-area-inset-right))", zIndex: 500, width: 60, height: 60, borderRadius: "50%", background: `linear-gradient(135deg, ${COLORS.gold}, ${COLORS.dustyPink})`, border: `2px solid ${COLORS.ivory}`, color: "#fff", fontSize: "1.6rem", cursor: "pointer", boxShadow: "0 6px 18px rgba(107,91,78,0.35)", display: "flex", alignItems: "center", justifyContent: "center", touchAction: "manipulation" }, title: "Open the Quran" }, "\uD83D\uDCD6"),
             bookOpen && (() => {
                 const p = BOOK_PAGES[bookPageIdx];
