@@ -33,3 +33,16 @@ VAPID_PUBLIC_KEY = "BCfEermZWQo2WSJEX8bpIeiAVih2lqyZlsuf7Vo2aZOeoyAvE1HLiXnFCj42
 [[kv_namespaces]]
 binding = "SUBSCRIPTIONS"
 id = "0148718ae6c249bdabb37f933b8c3f8c"
+
+# KV namespace for accounts (name + hashed password + each person's journal
+# data, so it can follow them across devices). Create this with
+# `wrangler kv namespace create USERS` and paste the id it prints below,
+# replacing the placeholder — same way SUBSCRIPTIONS was set up above.
+[[kv_namespaces]]
+binding = "USERS"
+id = "502d553f49e44940b8bbfe01e463a4ec"
+
+# ADMIN_KEY is a secret you make up yourself — a password only you know, used
+# to view the private /admin/users list of who has signed up. Set it with:
+#   wrangler secret put ADMIN_KEY
+# (never commit the actual value here — it's a secret, not a plain var)
